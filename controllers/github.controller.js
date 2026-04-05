@@ -2,8 +2,6 @@ const { getGitHubToken } = require("../services/auth.service");
 const github = require("../services/github.service");
 const { generatePRReview } = require("../services/ai.service");
 const { sendEmail } = require("../services/email.service");
-const fs = require("fs");
-const path = require("path");
 
 exports.createIssue = async (req, res, next) => {
   try {
@@ -15,214 +13,129 @@ exports.createIssue = async (req, res, next) => {
 
     res.json(r.data);
   } catch (err) {
-    next(err);
+    console.error("createIssue: error", err && err.message);
+    if (err && err.response) {
+      return res.status(err.response.status).json({ error: err.response.data || err.message });
+    }
+    return res.status(500).json({ error: err.message || "Internal error" });
   }
 };
 
 exports.reviewPR = async (req, res, next) => {
+  const requestId = `pr-${Date.now()}`;
+
   try {
-    const { repo, prNumber } = req.body;
+    console.log(`[${requestId}] Incoming reviewPR request`, {
+      path: req.path,
+      user: req.user?.sub || "anonymous",
+      body: req.body,
+    });
+
+    const { repo, prNumber } = req.body || {};
+
+    if (typeof repo !== "string" || !repo.includes("/")) {
+      return res.status(400).json({
+        error: "Invalid repo format. Expected 'owner/repo'",
+      });
+    }
+
+    if (!Number.isInteger(prNumber) || prNumber <= 0) {
+      return res.status(400).json({
+        error: "Invalid prNumber. Must be a positive integer",
+      });
+    }
+
+    if (!req.user?.sub) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     const token = await getGitHubToken(req.user.sub);
+    if (!token) {
+      throw new Error("GitHub token not found");
+    }
 
-    const pr = await github.getPR(repo, prNumber, token);
+    console.log(`[${requestId}] Fetching PR #${prNumber} from ${repo}`);
 
-    const files = await github.getPRFiles(repo, prNumber, token);
+    const [pr, files] = await Promise.all([
+      github.getPR(repo, prNumber, token),
+      github.getPRFiles(repo, prNumber, token),
+    ]);
 
-    const code = files.data
-      .map(f => f.patch)
-      .filter(Boolean)
-      .join("\n")
-      .slice(0, 8000);
+    if (!pr?.data) {
+      throw new Error("PR data not found");
+    }
 
-    const review = await generatePRReview(
-      code,
-      pr.data.title,
-      pr.data.body
-    );
+    const patches = (files?.data || [])
+      .map(f => f?.patch)
+      .filter(patch => typeof patch === "string");
+
+    if (patches.length === 0) {
+      console.warn(`[${requestId}] No patch data found`);
+    }
+
+    const MAX_CODE_LENGTH = 8000;
+    const fullCode = patches.join("\n");
+
+    const code =
+      fullCode.length > MAX_CODE_LENGTH
+        ? fullCode.slice(0, MAX_CODE_LENGTH) +
+          "\n\n// [TRUNCATED DUE TO LENGTH]"
+        : fullCode;
+
+    console.log(`[${requestId}] Code size: ${fullCode.length}`);
+
+    const review = await Promise.race([
+      generatePRReview(code, pr.data.title, pr.data.body),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("AI timeout")), 15000)
+      ),
+    ]);
+
+    if (!review) {
+      throw new Error("Empty review generated");
+    }
 
     await github.postComment(pr.data.comments_url, review, token);
 
-    res.json({ review });
+    // Send a static notification email with the review content
+    try {
+      const notifyEmail = process.env.NOTIFY_EMAIL || "elangoravi@gmail.com";
+      const subject = `PR Review — ${repo}#${prNumber}`;
+      console.log(`[${requestId}] Calling sendEmail ->`, { to: notifyEmail });
+      const emailResp = await sendEmail(notifyEmail, review, subject);
+      if (emailResp) {
+        console.log(`[${requestId}] Notification email sent to ${notifyEmail}`, { emailResp });
+      } else {
+        console.log(`[${requestId}] sendEmail returned no response (email likely skipped)`);
+      }
+    } catch (emailErr) {
+      console.warn(`[${requestId}] Failed to send notification email`, emailErr && emailErr.message);
+    }
+
+    console.log(`[${requestId}] Review posted successfully`);
+
+    return res.json({
+      success: true,
+      review,
+      meta: {
+        truncated: fullCode.length > MAX_CODE_LENGTH,
+        originalLength: fullCode.length,
+      },
+    });
   } catch (err) {
-    next(err);
-  }
-};
-
-// Handle GitHub push webhook: check changed files for obvious errors.
-// If bad code is found, create an issue and notify commit authors.
-// Assumptions:
-// - The pushed repository files are available on disk at process.env.PUSH_REPO_PATH
-//   or at process.cwd(). If that's not the case, the analysis will skip file reads.
-const axios = require("axios");
-
-// your utils
-// const { sendEmail } = require("../utils/email");
-// const github = require("../utils/github");
-// const { analyzeWithGroq } = require("../utils/groq");
-
-exports.handlePush = async (req, res, next) => {
-  const requestId = Date.now();
-
-  console.log(`\n==============================`);
-  console.log(`🚀 [${requestId}] PUSH WEBHOOK RECEIVED`);
-  console.log(`==============================`);
-
-  try {
-    console.log(`[${requestId}] Headers:`, {
-      event: req.headers["x-github-event"],
-      contentType: req.headers["content-type"],
+    console.error(`[${requestId}] reviewPR failed`, {
+      message: err.message,
+      stack: err.stack,
     });
 
-    console.log(`[${requestId}] Raw body:`, req.body);
-
-    // 🔥 HANDLE BOTH JSON + FORM PAYLOAD
-    let payload = req.body;
-
-    if (payload && payload.payload) {
-      try {
-        payload = JSON.parse(payload.payload);
-        console.log(`[${requestId}] ✅ Parsed form payload`);
-      } catch (e) {
-        console.error(`[${requestId}] ❌ Payload parse failed`, e.message);
-        return res.status(400).json({ ok: false, message: "Invalid payload" });
-      }
+    if (err.message.includes("timeout")) {
+      return res.status(504).json({ error: "Review generation timed out" });
     }
 
-    console.log(`[${requestId}] Payload keys:`, Object.keys(payload || {}));
-
-    const repo = payload.repository?.full_name;
-    const headCommit = payload.head_commit;
-    const commitId = headCommit?.id;
-
-    console.log(`[${requestId}] Repo:`, repo);
-    console.log(`[${requestId}] Commit:`, commitId);
-
-    if (!repo || !commitId) {
-      console.error(`[${requestId}] ❌ Missing repo or commit`);
-      return res.status(400).json({ ok: false, message: "Invalid payload data" });
+    if (err.message.includes("GitHub")) {
+      return res.status(502).json({ error: "GitHub API error" });
     }
 
-    const token = process.env.GITHUB_TOKEN;
-    if (!token) {
-      throw new Error("Missing GITHUB_TOKEN");
-    }
-
-    const [owner, repoName] = repo.split("/");
-
-    // 🔥 FETCH COMMIT DATA
-    console.log(`[${requestId}] Fetching commit from GitHub...`);
-
-    let commitRes;
-    try {
-      commitRes = await axios.get(
-        `https://api.github.com/repos/${owner}/${repoName}/commits/${commitId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/vnd.github+json",
-          },
-        }
-      );
-    } catch (err) {
-      console.error(`[${requestId}] ❌ GitHub API error`);
-      console.error("Status:", err.response?.status);
-      console.error("Data:", err.response?.data);
-      throw err;
-    }
-
-    const files = commitRes.data.files || [];
-
-    console.log(`[${requestId}] Files changed:`, files.length);
-
-    if (files.length === 0) {
-      return res.json({ ok: true, message: "No files to analyze" });
-    }
-
-    // 🔥 BUILD DIFF
-    let combinedDiff = "";
-
-    for (const file of files) {
-      console.log(`[${requestId}] File:`, file.filename);
-
-      combinedDiff += `\n\nFILE: ${file.filename}\n`;
-      combinedDiff += file.patch || "No diff";
-    }
-
-    console.log(`[${requestId}] Diff length:`, combinedDiff.length);
-
-    // 🔥 LLM CALL
-    let issues = [];
-    try {
-      console.log(`[${requestId}] Calling Groq...`);
-
-      issues = await analyzeWithGroq(combinedDiff);
-
-      console.log(`[${requestId}] LLM result:`, issues);
-    } catch (err) {
-      console.error(`[${requestId}] ❌ Groq error`, err.message);
-      throw err;
-    }
-
-    const authorEmail =
-      headCommit?.author?.email || "default@email.com";
-
-    // 🔥 IF ISSUES
-    if (issues && issues.length > 0) {
-      console.log(`[${requestId}] 🚨 Issues found:`, issues.length);
-
-      const title = `🚨 AI Review Issues`;
-
-      const body = [
-        `Repo: ${repo}`,
-        `Commit: ${commitId}`,
-        `\nIssues:\n`,
-        ...issues.map(
-          (i) =>
-            `- [${i.severity || "unknown"}] ${i.file}: ${i.issue}`
-        ),
-      ].join("\n");
-
-      // create issue
-      try {
-        await github.createIssue(repo, title, body, token);
-        console.log(`[${requestId}] ✅ Issue created`);
-      } catch (err) {
-        console.error(`[${requestId}] ❌ Issue failed`, err.message);
-      }
-
-      // send mail
-      try {
-        await sendEmail(authorEmail, "Issues found", body);
-        console.log(`[${requestId}] ✅ Email sent`);
-      } catch (err) {
-        console.error(`[${requestId}] ❌ Email failed`, err.message);
-      }
-
-      return res.json({ ok: false, issues });
-    }
-
-    // 🔥 NO ISSUES
-    console.log(`[${requestId}] ✅ No issues`);
-
-    try {
-      await sendEmail(
-        authorEmail,
-        "Commit looks good",
-        `Commit ${commitId} passed all checks`
-      );
-    } catch (err) {
-      console.error(`[${requestId}] ❌ Email failed`, err.message);
-    }
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error(`\n[${requestId}] 💥 FATAL ERROR`);
-    console.error(err.stack || err.message);
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message,
-    });
+    return next(err);
   }
 };

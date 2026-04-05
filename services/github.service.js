@@ -1,5 +1,10 @@
 const axios = require("axios");
 
+exports.listPRs = (repo, token) =>
+  axios.get(`https://api.github.com/repos/${repo}/pulls`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
 exports.getPR = (repo, prNumber, token) =>
   axios.get(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
     headers: { Authorization: `Bearer ${token}` },

@@ -8,7 +8,7 @@ exports.runAgent = async (req, res, next) => {
     const { repo } = req.body;
     const token = await getGitHubToken(req.user.sub);
 
-    const prs = await github.getPR(repo, "", token);
+    const prs = await github.listPRs(repo, token);
     const pr = prs.data[0];
 
     const files = await github.getPRFiles(repo, pr.number, token);
