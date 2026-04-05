@@ -67,8 +67,10 @@ exports.handlePush = async (req, res, next) => {
       ip: req.ip,
     });
 
-    const payload = req.body || {};
-    const repo = (payload.repository && payload.repository.full_name) || req.body.repo;
+  const payload = req.body || {};
+  // Use the safe `payload` reference instead of directly accessing `req.body` to
+  // avoid runtime errors when `req.body` is undefined in some environments.
+  const repo = (payload.repository && payload.repository.full_name) || payload.repo;
 
     const commits = Array.isArray(payload.commits) ? payload.commits : [];
 
