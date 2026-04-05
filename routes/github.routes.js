@@ -11,6 +11,8 @@ const router = express.Router();
 
 router.post("/issue", verifyToken, createIssue);
 router.post("/review", verifyToken, reviewPR);
-router.post("/push", verifyToken, handlePush);
+// GitHub will POST webhooks without a user JWT. Keep this route public and
+// verify webhook signatures in the future for security (recommended).
+router.post("/push", handlePush);
 
 module.exports = router;

@@ -56,6 +56,17 @@ exports.reviewPR = async (req, res, next) => {
 //   or at process.cwd(). If that's not the case, the analysis will skip file reads.
 exports.handlePush = async (req, res, next) => {
   try {
+    // Basic request-level logging to help debug webhook 401s and payload problems.
+    console.log("handlePush: webhook received", {
+      path: req.path,
+      method: req.method,
+      // log key GitHub headers (don't print entire headers to avoid secrets)
+      github_event: req.headers["x-github-event"] || req.headers["x-hub-event"],
+      has_signature: !!(req.headers["x-hub-signature-256"] || req.headers["x-hub-signature"]),
+      user_present: !!req.user,
+      ip: req.ip,
+    });
+
     const payload = req.body || {};
     const repo = (payload.repository && payload.repository.full_name) || req.body.repo;
 
@@ -72,7 +83,9 @@ exports.handlePush = async (req, res, next) => {
       if (c.committer && c.committer.email) authorEmails.add(c.committer.email);
     }
 
-    const repoPath = process.env.PUSH_REPO_PATH || process.cwd();
+  const repoPath = process.env.PUSH_REPO_PATH || process.cwd();
+
+  console.log(`handlePush: repo=${repo || '<unknown>'}, commits=${commits.length}, repoPath=${repoPath}`);
 
     const issues = [];
 
@@ -83,6 +96,7 @@ exports.handlePush = async (req, res, next) => {
         content = fs.readFileSync(abs, "utf8");
       } catch (err) {
         // If file isn't present on disk we skip deep analysis, but note it.
+        console.warn("handlePush: file not available on disk", { file: filePath, abs, message: err && err.message });
         issues.push({ file: filePath, message: `file not available on disk: ${err.message}` });
         continue;
       }
@@ -95,6 +109,7 @@ exports.handlePush = async (req, res, next) => {
             // Wrap in function to avoid top-level import/export errors — still catches many syntax errors.
             new Function(content);
           } catch (e) {
+            console.warn("handlePush: syntax detected", { file: filePath, message: e && e.message });
             issues.push({ file: filePath, message: `syntax error: ${e.message}` });
             continue;
           }
@@ -112,6 +127,7 @@ exports.handlePush = async (req, res, next) => {
           issues.push({ file: filePath, message: "TODO/FIXME marker found" });
         }
       } catch (err) {
+        console.error("handlePush: analysis error", { file: filePath, message: err && err.message });
         issues.push({ file: filePath, message: `analysis error: ${err.message}` });
       }
     }
@@ -119,7 +135,17 @@ exports.handlePush = async (req, res, next) => {
     if (issues.length > 0) {
       // Create an issue describing the problems
       try {
-        const token = await getGitHubToken(req.user && req.user.sub);
+        // Try to obtain a GitHub token only if an authenticated user context is present.
+        let token;
+        if (req.user && req.user.sub) {
+          try {
+            token = await getGitHubToken(req.user.sub);
+          } catch (tErr) {
+            console.warn("handlePush: getGitHubToken failed", tErr && tErr.message);
+          }
+        } else {
+          console.log("handlePush: no authenticated user provided for token retrieval; skipping createIssue with token");
+        }
 
         const title = `Automated: Problems found in pushed code (${new Date().toISOString()})`;
 
@@ -135,11 +161,18 @@ exports.handlePush = async (req, res, next) => {
         const body = bodyLines.join("\n");
 
         if (repo && token) {
-          await github.createIssue(repo, title, body, token);
+          try {
+            await github.createIssue(repo, title, body, token);
+            console.log("handlePush: created GitHub issue in", repo);
+          } catch (createErr) {
+            console.warn("handlePush: failed to create GitHub issue", createErr && createErr.message);
+          }
+        } else if (repo && !token) {
+          console.log("handlePush: skipping GitHub issue creation because no token is available");
         }
 
         // Notify commit authors by email (best-effort)
-        const decision = `Automated push check found ${issues.length} issue(s). An issue has been opened in ${repo || "the repository"} with details.`;
+        const decision = `Automated push check found ${issues.length} issue(s).`;
         for (const email of authorEmails) {
           try {
             await sendEmail(email, decision, `Automated push check — ${repo || "repo"}`);
@@ -157,6 +190,7 @@ exports.handlePush = async (req, res, next) => {
     }
 
     // No issues found — respond success
+    console.log("handlePush: no issues detected");
     return res.json({ ok: true, message: "No issues detected" });
   } catch (err) {
     next(err);
