@@ -57,6 +57,7 @@ exports.reviewPR = async (req, res, next) => {
 exports.handlePush = async (req, res, next) => {
   try {
     // Basic request-level logging to help debug webhook 401s and payload problems.
+    const contentType = req.headers["content-type"] || req.headers["Content-Type"] || "<unknown>";
     console.log("handlePush: webhook received", {
       path: req.path,
       method: req.method,
@@ -65,9 +66,22 @@ exports.handlePush = async (req, res, next) => {
       has_signature: !!(req.headers["x-hub-signature-256"] || req.headers["x-hub-signature"]),
       user_present: !!req.user,
       ip: req.ip,
+      content_type: contentType,
+      // top-level keys only to avoid dumping large or sensitive payloads
+      body_keys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : typeof req.body,
     });
 
-  const payload = req.body || {};
+    // Normalize payload: GitHub sometimes sends payload as a string field named `payload`
+    // (form-encoded webhooks). If that's the case, parse it. Otherwise use req.body.
+    let payload = req.body || {};
+    if (payload && typeof payload.payload === "string") {
+      try {
+        payload = JSON.parse(payload.payload);
+        console.log("handlePush: parsed nested payload from form-encoded body");
+      } catch (e) {
+        console.warn("handlePush: failed to parse nested payload", e && e.message);
+      }
+    }
   // Use the safe `payload` reference instead of directly accessing `req.body` to
   // avoid runtime errors when `req.body` is undefined in some environments.
   const repo = (payload.repository && payload.repository.full_name) || payload.repo;
