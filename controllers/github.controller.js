@@ -128,6 +128,10 @@ exports.reviewPR = async (req, res, next) => {
       stack: err.stack,
     });
 
+    if (err.response?.status === 404) {
+      return res.status(404).json({ error: `PR #${req.body?.prNumber} does not exist in ${req.body?.repo}` });
+    }
+
     if (err.message.includes("timeout")) {
       return res.status(504).json({ error: "Review generation timed out" });
     }

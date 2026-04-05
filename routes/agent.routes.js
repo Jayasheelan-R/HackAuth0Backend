@@ -16,12 +16,12 @@ router.get("/credentials", verifyToken, async (req, res) => {
   }
 });
 
-router.delete("/credentials/:credentialId", verifyToken, async (req, res) => {
+router.delete("/credentials/:provider/:providerId", verifyToken, async (req, res) => {
   try {
-    const result = await revokeCredential(req.user.sub, req.params.credentialId);
+    const result = await revokeCredential(req.user.sub, req.params.provider, req.params.providerId);
     res.json(result);
   } catch (err) {
-    console.error("Token Vault revoke error:", err.response?.data || err.message);
+    console.error("Unlink identity error:", err.response?.data || err.message);
     res.status(500).json({ error: err.message });
   }
 });
