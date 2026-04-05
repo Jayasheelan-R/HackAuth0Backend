@@ -62,118 +62,173 @@ const axios = require("axios");
 // const { analyzeWithGroq } = require("../utils/groq"); // your existing LLM logic
 
 exports.handlePush = async (req, res, next) => {
+  const requestId = Date.now(); // simple trace id
+
+  console.log(`\n==============================`);
+  console.log(`🚀 [${requestId}] PUSH WEBHOOK RECEIVED`);
+  console.log(`==============================`);
+
   try {
+    console.log(`[${requestId}] Headers:`, {
+      event: req.headers["x-github-event"],
+      delivery: req.headers["x-github-delivery"],
+      contentType: req.headers["content-type"],
+    });
+
+    console.log(`[${requestId}] Raw body keys:`, Object.keys(req.body || {}));
+
     const payload = req.body;
 
     const repo = payload.repository?.full_name;
     const headCommit = payload.head_commit;
     const commitId = headCommit?.id;
 
+    console.log(`[${requestId}] Repo:`, repo);
+    console.log(`[${requestId}] Commit ID:`, commitId);
+
     if (!repo || !commitId) {
+      console.error(`[${requestId}] ❌ Invalid payload`);
       return res.status(400).json({ ok: false, message: "Invalid payload" });
     }
 
-    console.log("Push received:", { repo, commitId });
-
     const token = process.env.GITHUB_TOKEN;
+
     if (!token) {
+      console.error(`[${requestId}] ❌ Missing GITHUB_TOKEN`);
       throw new Error("Missing GITHUB_TOKEN");
     }
 
-    // 🔥 STEP 1: Get commit details
     const [owner, repoName] = repo.split("/");
 
-    const commitRes = await axios.get(
-      `https://api.github.com/repos/${owner}/${repoName}/commits/${commitId}`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-        },
-      }
-    );
+    console.log(`[${requestId}] Fetching commit from GitHub...`);
+
+    // 🔥 STEP 1: GitHub API
+    let commitRes;
+    try {
+      commitRes = await axios.get(
+        `https://api.github.com/repos/${owner}/${repoName}/commits/${commitId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+          },
+        }
+      );
+    } catch (err) {
+      console.error(`[${requestId}] ❌ GitHub API FAILED`);
+      console.error("Status:", err.response?.status);
+      console.error("Data:", err.response?.data);
+      console.error("Message:", err.message);
+      throw err;
+    }
 
     const files = commitRes.data.files || [];
 
+    console.log(`[${requestId}] Files changed:`, files.length);
+
     if (files.length === 0) {
-      console.log("No changed files");
+      console.warn(`[${requestId}] ⚠️ No files in commit`);
       return res.json({ ok: true, message: "No files to analyze" });
     }
 
-    // 🔥 STEP 2: Prepare diff for LLM
+    // 🔥 STEP 2: Build diff
     let combinedDiff = "";
 
     for (const file of files) {
+      console.log(`[${requestId}] Processing file:`, file.filename);
+
       combinedDiff += `\n\nFILE: ${file.filename}\n`;
       combinedDiff += file.patch || "No diff available";
     }
 
-    console.log("Sending diff to LLM...");
+    console.log(`[${requestId}] Diff size:`, combinedDiff.length);
 
-    // 🔥 STEP 3: Run Groq (your existing function)
-    const issues = await analyzeWithGroq(combinedDiff);
+    // 🔥 STEP 3: LLM CALL
+    let issues = [];
+    try {
+      console.log(`[${requestId}] Sending to Groq...`);
 
-    // Expected format:
-    // [
-    //   { file: "...", issue: "...", severity: "low|medium|high" }
-    // ]
+      issues = await analyzeWithGroq(combinedDiff);
+
+      console.log(`[${requestId}] LLM Response:`, issues);
+    } catch (err) {
+      console.error(`[${requestId}] ❌ Groq FAILED`);
+      console.error(err.message);
+      throw err;
+    }
 
     const authorEmail =
       headCommit?.author?.email || "default@email.com";
 
-    // 🔥 STEP 4: If issues found
-    if (issues && issues.length > 0) {
-      console.log("Issues found:", issues.length);
+    console.log(`[${requestId}] Author email:`, authorEmail);
 
-      const title = `🚨 AI Code Review: Issues detected in latest push`;
+    // 🔥 STEP 4: Issues found
+    if (issues && issues.length > 0) {
+      console.log(`[${requestId}] 🚨 Issues detected:`, issues.length);
+
+      const title = `🚨 AI Code Review Issues`;
 
       const body = [
-        `Repository: ${repo}`,
+        `Repo: ${repo}`,
         `Commit: ${commitId}`,
-        `\nDetected Issues:\n`,
+        `\nIssues:\n`,
         ...issues.map(
-          (i) => `- [${i.severity?.toUpperCase() || "UNKNOWN"}] ${i.file}: ${i.issue}`
+          (i) =>
+            `- [${i.severity || "unknown"}] ${i.file}: ${i.issue}`
         ),
       ].join("\n");
 
-      // 👉 Create GitHub issue
+      // 👉 Create GitHub Issue
       try {
+        console.log(`[${requestId}] Creating GitHub issue...`);
+
         await github.createIssue(repo, title, body, token);
-        console.log("GitHub issue created");
+
+        console.log(`[${requestId}] ✅ GitHub issue created`);
       } catch (err) {
-        console.warn("Failed to create issue:", err.message);
+        console.error(`[${requestId}] ❌ Issue creation failed`);
+        console.error(err.message);
       }
 
-      // 👉 Send email
+      // 👉 Send Email
       try {
-        await sendEmail(
-          authorEmail,
-          `⚠️ Issues found in your commit`,
-          body
-        );
+        console.log(`[${requestId}] Sending email...`);
+
+        await sendEmail(authorEmail, "Issues found", body);
+
+        console.log(`[${requestId}] ✅ Email sent`);
       } catch (err) {
-        console.warn("Email failed:", err.message);
+        console.error(`[${requestId}] ❌ Email failed`);
+        console.error(err.message);
       }
 
       return res.json({ ok: false, issues });
     }
 
-    // 🔥 STEP 5: No issues → success mail
-    console.log("No issues found");
+    // 🔥 STEP 5: No issues
+    console.log(`[${requestId}] ✅ No issues found`);
 
     try {
       await sendEmail(
         authorEmail,
-        `✅ Commit looks good`,
-        `Your latest commit (${commitId}) passed all automated checks.`
+        "Commit looks good",
+        `Commit ${commitId} passed all checks`
       );
+
+      console.log(`[${requestId}] ✅ Success email sent`);
     } catch (err) {
-      console.warn("Email failed:", err.message);
+      console.error(`[${requestId}] ❌ Email failed`);
+      console.error(err.message);
     }
 
-    return res.json({ ok: true, message: "No issues detected" });
+    return res.json({ ok: true });
   } catch (err) {
-    console.error("handlePush error:", err.message);
-    next(err);
+    console.error(`\n[${requestId}] 💥 FATAL ERROR`);
+    console.error(err.stack || err.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message,
+    });
   }
 };
