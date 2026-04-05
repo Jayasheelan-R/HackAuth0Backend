@@ -54,161 +54,126 @@ exports.reviewPR = async (req, res, next) => {
 // Assumptions:
 // - The pushed repository files are available on disk at process.env.PUSH_REPO_PATH
 //   or at process.cwd(). If that's not the case, the analysis will skip file reads.
+const axios = require("axios");
+
+// 👉 You already have these
+// const { sendEmail } = require("../utils/email");
+// const github = require("../utils/github");
+// const { analyzeWithGroq } = require("../utils/groq"); // your existing LLM logic
+
 exports.handlePush = async (req, res, next) => {
   try {
-    // Basic request-level logging to help debug webhook 401s and payload problems.
-    const contentType = req.headers["content-type"] || req.headers["Content-Type"] || "<unknown>";
-    console.log("handlePush: webhook received", {
-      path: req.path,
-      method: req.method,
-      // log key GitHub headers (don't print entire headers to avoid secrets)
-      github_event: req.headers["x-github-event"] || req.headers["x-hub-event"],
-      has_signature: !!(req.headers["x-hub-signature-256"] || req.headers["x-hub-signature"]),
-      user_present: !!req.user,
-      ip: req.ip,
-      content_type: contentType,
-      // top-level keys only to avoid dumping large or sensitive payloads
-      body_keys: req.body && typeof req.body === 'object' ? Object.keys(req.body) : typeof req.body,
-    });
+    const payload = req.body;
 
-    // Normalize payload: GitHub sometimes sends payload as a string field named `payload`
-    // (form-encoded webhooks). If that's the case, parse it. Otherwise use req.body.
-    let payload = req.body || {};
-    if (payload && typeof payload.payload === "string") {
-      try {
-        payload = JSON.parse(payload.payload);
-        console.log("handlePush: parsed nested payload from form-encoded body");
-      } catch (e) {
-        console.warn("handlePush: failed to parse nested payload", e && e.message);
-      }
-    }
-  // Use the safe `payload` reference instead of directly accessing `req.body` to
-  // avoid runtime errors when `req.body` is undefined in some environments.
-  const repo = (payload.repository && payload.repository.full_name) || payload.repo;
+    const repo = payload.repository?.full_name;
+    const headCommit = payload.head_commit;
+    const commitId = headCommit?.id;
 
-    const commits = Array.isArray(payload.commits) ? payload.commits : [];
-
-    const changedFiles = new Set();
-    const authorEmails = new Set();
-
-    for (const c of commits) {
-      if (c.added) c.added.forEach(f => changedFiles.add(f));
-      if (c.modified) c.modified.forEach(f => changedFiles.add(f));
-      if (c.removed) c.removed && c.removed.forEach(f => changedFiles.add(f));
-      if (c.author && c.author.email) authorEmails.add(c.author.email);
-      if (c.committer && c.committer.email) authorEmails.add(c.committer.email);
+    if (!repo || !commitId) {
+      return res.status(400).json({ ok: false, message: "Invalid payload" });
     }
 
-  const repoPath = process.env.PUSH_REPO_PATH || process.cwd();
+    console.log("Push received:", { repo, commitId });
 
-  console.log(`handlePush: repo=${repo || '<unknown>'}, commits=${commits.length}, repoPath=${repoPath}`);
-
-    const issues = [];
-
-    for (const filePath of changedFiles) {
-      const abs = path.resolve(repoPath, filePath);
-      let content;
-      try {
-        content = fs.readFileSync(abs, "utf8");
-      } catch (err) {
-        // If file isn't present on disk we skip deep analysis, but note it.
-        console.warn("handlePush: file not available on disk", { file: filePath, abs, message: err && err.message });
-        issues.push({ file: filePath, message: `file not available on disk: ${err.message}` });
-        continue;
-      }
-
-      // Simple heuristics / lightweight checks
-      try {
-        if (filePath.endsWith(".js") || filePath.endsWith(".mjs") || filePath.endsWith(".cjs")) {
-          // Attempt to detect syntax errors by using Function (simple check)
-          try {
-            // Wrap in function to avoid top-level import/export errors — still catches many syntax errors.
-            new Function(content);
-          } catch (e) {
-            console.warn("handlePush: syntax detected", { file: filePath, message: e && e.message });
-            issues.push({ file: filePath, message: `syntax error: ${e.message}` });
-            continue;
-          }
-        }
-
-        // Generic heuristics (dangerous patterns)
-        if (/\beval\s*\(/.test(content)) {
-          issues.push({ file: filePath, message: "usage of eval() detected" });
-        }
-        if (/process\.exit\s*\(/.test(content)) {
-          issues.push({ file: filePath, message: "usage of process.exit() detected" });
-        }
-        // TODO/FIXME markers may indicate incomplete code
-        if (/TODO|FIXME/.test(content)) {
-          issues.push({ file: filePath, message: "TODO/FIXME marker found" });
-        }
-      } catch (err) {
-        console.error("handlePush: analysis error", { file: filePath, message: err && err.message });
-        issues.push({ file: filePath, message: `analysis error: ${err.message}` });
-      }
+    const token = process.env.GITHUB_TOKEN;
+    if (!token) {
+      throw new Error("Missing GITHUB_TOKEN");
     }
 
-    if (issues.length > 0) {
-      // Create an issue describing the problems
+    // 🔥 STEP 1: Get commit details
+    const [owner, repoName] = repo.split("/");
+
+    const commitRes = await axios.get(
+      `https://api.github.com/repos/${owner}/${repoName}/commits/${commitId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+        },
+      }
+    );
+
+    const files = commitRes.data.files || [];
+
+    if (files.length === 0) {
+      console.log("No changed files");
+      return res.json({ ok: true, message: "No files to analyze" });
+    }
+
+    // 🔥 STEP 2: Prepare diff for LLM
+    let combinedDiff = "";
+
+    for (const file of files) {
+      combinedDiff += `\n\nFILE: ${file.filename}\n`;
+      combinedDiff += file.patch || "No diff available";
+    }
+
+    console.log("Sending diff to LLM...");
+
+    // 🔥 STEP 3: Run Groq (your existing function)
+    const issues = await analyzeWithGroq(combinedDiff);
+
+    // Expected format:
+    // [
+    //   { file: "...", issue: "...", severity: "low|medium|high" }
+    // ]
+
+    const authorEmail =
+      headCommit?.author?.email || "default@email.com";
+
+    // 🔥 STEP 4: If issues found
+    if (issues && issues.length > 0) {
+      console.log("Issues found:", issues.length);
+
+      const title = `🚨 AI Code Review: Issues detected in latest push`;
+
+      const body = [
+        `Repository: ${repo}`,
+        `Commit: ${commitId}`,
+        `\nDetected Issues:\n`,
+        ...issues.map(
+          (i) => `- [${i.severity?.toUpperCase() || "UNKNOWN"}] ${i.file}: ${i.issue}`
+        ),
+      ].join("\n");
+
+      // 👉 Create GitHub issue
       try {
-        // Try to obtain a GitHub token only if an authenticated user context is present.
-        let token;
-        if (req.user && req.user.sub) {
-          try {
-            token = await getGitHubToken(req.user.sub);
-          } catch (tErr) {
-            console.warn("handlePush: getGitHubToken failed", tErr && tErr.message);
-          }
-        } else {
-          console.log("handlePush: no authenticated user provided for token retrieval; skipping createIssue with token");
-        }
-
-        const title = `Automated: Problems found in pushed code (${new Date().toISOString()})`;
-
-        const bodyLines = [
-          `The automated push-checker detected potential problems in the recent push to ${repo || "<unknown>"}.`,
-          "\nDetected issues:\n",
-        ];
-
-        for (const it of issues) {
-          bodyLines.push(`- ${it.file}: ${it.message}`);
-        }
-
-        const body = bodyLines.join("\n");
-
-        if (repo && token) {
-          try {
-            await github.createIssue(repo, title, body, token);
-            console.log("handlePush: created GitHub issue in", repo);
-          } catch (createErr) {
-            console.warn("handlePush: failed to create GitHub issue", createErr && createErr.message);
-          }
-        } else if (repo && !token) {
-          console.log("handlePush: skipping GitHub issue creation because no token is available");
-        }
-
-        // Notify commit authors by email (best-effort)
-        const decision = `Automated push check found ${issues.length} issue(s).`;
-        for (const email of authorEmails) {
-          try {
-            await sendEmail(email, decision, `Automated push check — ${repo || "repo"}`);
-          } catch (err) {
-            // swallow email errors — notification is best-effort
-            console.warn("sendEmail failed for", email, err && err.message);
-          }
-        }
+        await github.createIssue(repo, title, body, token);
+        console.log("GitHub issue created");
       } catch (err) {
-        // If creating issue / sending email fails, still report detection
-        console.error("handlePush: failed to create issue or send mail:", err && err.message);
+        console.warn("Failed to create issue:", err.message);
+      }
+
+      // 👉 Send email
+      try {
+        await sendEmail(
+          authorEmail,
+          `⚠️ Issues found in your commit`,
+          body
+        );
+      } catch (err) {
+        console.warn("Email failed:", err.message);
       }
 
       return res.json({ ok: false, issues });
     }
 
-    // No issues found — respond success
-    console.log("handlePush: no issues detected");
+    // 🔥 STEP 5: No issues → success mail
+    console.log("No issues found");
+
+    try {
+      await sendEmail(
+        authorEmail,
+        `✅ Commit looks good`,
+        `Your latest commit (${commitId}) passed all automated checks.`
+      );
+    } catch (err) {
+      console.warn("Email failed:", err.message);
+    }
+
     return res.json({ ok: true, message: "No issues detected" });
   } catch (err) {
+    console.error("handlePush error:", err.message);
     next(err);
   }
 };
