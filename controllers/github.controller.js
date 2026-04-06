@@ -97,20 +97,16 @@ exports.reviewPR = async (req, res, next) => {
 
     await github.postComment(pr.data.comments_url, review, token);
 
-    // Send a static notification email with the review content
-    try {
-      const notifyEmail = process.env.NOTIFY_EMAIL || "elangoravi@gmail.com";
-      const subject = `PR Review — ${repo}#${prNumber}`;
-      console.log(`[${requestId}] Calling sendEmail ->`, { to: notifyEmail });
-      const emailResp = await sendEmail(notifyEmail, review, subject);
-      if (emailResp) {
+    // Send notification email asynchronously (non-blocking)
+    const notifyEmail = process.env.NOTIFY_EMAIL || "elangoravi@gmail.com";
+    const subject = `PR Review — ${repo}#${prNumber}`;
+    sendEmail(notifyEmail, review, subject)
+      .then((emailResp) => {
         console.log(`[${requestId}] Notification email sent to ${notifyEmail}`, { emailResp });
-      } else {
-        console.log(`[${requestId}] sendEmail returned no response (email likely skipped)`);
-      }
-    } catch (emailErr) {
-      console.warn(`[${requestId}] Failed to send notification email`, emailErr && emailErr.message);
-    }
+      })
+      .catch((emailErr) => {
+        console.warn(`[${requestId}] Failed to send notification email`, emailErr?.message);
+      });
 
     console.log(`[${requestId}] Review posted successfully`);
 
