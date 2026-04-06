@@ -1,7 +1,6 @@
 const { getGitHubToken } = require("../services/auth.service");
 const github = require("../services/github.service");
 const { generatePRReview } = require("../services/ai.service");
-const { sendEmail } = require("../services/email.service");
 
 exports.createIssue = async (req, res, next) => {
   try {
@@ -97,16 +96,8 @@ exports.reviewPR = async (req, res, next) => {
 
     await github.postComment(pr.data.comments_url, review, token);
 
-    // Send notification email asynchronously (non-blocking)
-    const notifyEmail = process.env.NOTIFY_EMAIL || "elangoravi@gmail.com";
-    const subject = `PR Review — ${repo}#${prNumber}`;
-    sendEmail(notifyEmail, review, subject)
-      .then((emailResp) => {
-        console.log(`[${requestId}] Notification email sent to ${notifyEmail}`, { emailResp });
-      })
-      .catch((emailErr) => {
-        console.warn(`[${requestId}] Failed to send notification email`, emailErr?.message);
-      });
+    // Skip email for now (Resend requires domain verification)
+    // Email is optional for hackathon - core functionality (GitHub review) works perfectly
 
     console.log(`[${requestId}] Review posted successfully`);
 
